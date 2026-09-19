@@ -1,5 +1,7 @@
 # Jev Swarm — 10-Snake Arena
 
+English | [简体中文](README.zh-CN.md)
+
 <p align="center">
   <img src="docs/img/hero.png" alt="Jev Swarm running in Jev Joint mode — 10 snakes, one API call per tick, live probability feed" width="880">
 </p>
