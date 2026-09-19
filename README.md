@@ -1,78 +1,95 @@
 # Jev Swarm — 10-Snake Arena
 
+<p align="center">
+  <img src="docs/img/hero.png" alt="Jev Swarm running in Jev Joint mode — 10 snakes, one API call per tick, live probability feed" width="880">
+</p>
+
 **One world. Ten agents. Ten judgments. One Jev call.**
 
-A browser-based multi-agent snake experiment built to test [TypeSafe AI's Jev](https://docs.typesafe.ai) (a "System-One" model) as a **parallel decision engine**: every logic tick sends **one** API request containing a Choice question per snake, receives N full probability distributions over `LEFT / STRAIGHT / RIGHT` in parallel, and a deterministic **Joint Action Resolver** turns them into a collision-free joint action.
+Jev Swarm is a research playground for [TypeSafe AI's Jev](https://docs.typesafe.ai) — a *"System-One"* model that returns typed decisions instead of text. Ten cooperative snakes share one 30×30 arena, and **every tick sends a single API request carrying all ten snakes' questions**. The model answers with a full probability distribution per snake; a deterministic **Joint Action Resolver** turns those distributions into one collision-free joint action.
 
-> Built from the development plan in `docs/plan.md` (Jev_Swarm_10_Snake_Arena_开发方案).
+The point is not the game. It is a controlled experiment:
 
-## Quick start
+> **How much intelligence does one small model contribute to a multi-agent system — and how much comes from the code around it?**
+
+## How it works
+
+```mermaid
+flowchart TD
+    A["SnakeWorld<br/>deterministic engine · seeded RNG · hard collision rules"] -->|"snapshot"| B["State Analyzer — code computes FACTS<br/>BFS food distance · flood fill · dead-end risk · conflict counts"]
+    B -->|"shared state + 10 Choice questions"| C["Jev — ONE request per tick<br/>10 parallel probability distributions"]
+    C -->|"P(LEFT / STRAIGHT / RIGHT) × 10"| D["Joint Action Resolver<br/>maximize Σ log P · hard constraints only"]
+    D -->|"joint action"| E["Execute → advance world"]
+```
+
+**Facts vs judgment.** The model never computes distances, flood fills or collision checks — code hands it precomputed per-action features and it only makes the contextual call. Positions are public physics (each snake sees its own body and every other snake's head); **intentions stay private** — no question may see another question's answer.
+
+**Why full probability distributions matter.** Two snakes will eventually want the same food. Independent judgments cannot negotiate — but because Jev returns the *entire* distribution, the resolver can break the tie deterministically: the snake with the stronger preference takes the cell, the other falls back to its next-best move. Zero extra API calls.
+
+**Survival is not enough.** Snakes that only avoid danger are a failure — the prompt states both team goals explicitly, and the *Rule / Greedy* baseline exists to keep the bar honest.
+
+## What each mode measures
+
+| Mode | Code assist | What it answers |
+|---|---|---|
+| Random | none | the floor — what pure chance achieves |
+| Rule / Greedy | none | a hand-written survival-first heuristic |
+| **Jev Raw** | none | **the model alone** — top-1 executed verbatim, deaths count as-is |
+| **Jev Joint** | resolver referees | model judgment + deterministic safety net |
+
+The headline diagnostic is the **override rate**, always visible in the UI: if the resolver rewrites most decisions, the code is playing the game — not the model. That is the project's Go/No-Go gate (plan §13): keep the referee dumb, measure the difference.
+
+## Findings so far (real runs, one machine)
+
+- **Prompt design is part of the interface.** A survival-only instruction template made Jev *never eat* — 0 eats in 8 ticks, confidence ~0.42. Stating both goals first-class (with the risk features as guardrails) flipped it: **6–8 eats per 25 ticks, 0 deaths, confidence 0.79–0.88**.
+- **A stronger baseline makes the test honest.** Upgrading Rule/Greedy to survival-first-then-max-food raised its own score (generations 7 → 2, food 409 → 552 per 2,000 ticks) — and raised the bar Jev must clear.
+- **Parallelism is real.** A 10-question request costs ~0.37 s p50 / ~1.24 s p95 — the model answers ten judgments in roughly the time of one.
+- **The resolver is cheap.** 3¹⁰ enumeration with pruning ≈ 0.5 ms; beam search for 20 agents ≈ 22 ms.
+
+## Decision Lens
+
+Click any snake to open its mind for the current tick — full probability bars, the model's proposed move vs the resolver's executed move, the override reason, and the per-action feature table the decision was based on.
+
+<p align="center">
+  <img src="docs/img/decision-lens.png" alt="Decision Lens — probability bars, proposed vs executed move, feature table" width="420">
+</p>
+
+## Run it
 
 ```bash
 npm install
-cp .env.example .env        # paste your TYPESAFE_API_KEY from console.typesafe.ai/keys
-npm run dev                 # starts proxy (:8799) + web app (:5173)
+cp .env.example .env    # paste your TYPESAFE_API_KEY from console.typesafe.ai/keys
+npm run dev             # proxy on :8799 + web app on :5173
 ```
 
-Open **http://localhost:5173**.
+Open <http://localhost:5173>, pick **Jev Joint**, press **▶ 开始**.
 
-- Without an API key the app still runs — Random / Rule modes are fully local, and the Jev mode options stay locked in the UI until a key is configured (paste it in the API Key section, or keep `.env`).
-- `npm test` — 32 unit tests (collision, resolver, features, controllers, state schema).
-- `npm run build` — type-check + production build.
-
-## Architecture (plan §3)
-
-```
-SnakeWorld (deterministic engine, seeded RNG)
-   │ snapshot
-State Analyzer (code computes FACTS: legality, BFS food distance, flood-fill space, risks)
-   │ shared state + N Choice questions
-Jev  ────────────── ONE request / tick → N parallel probability distributions
-   │ probability matrix
-Joint Action Resolver (argmax Σ log P_i(a_i) subject to hard constraints)
-   │ joint action
-Execute → advance world
-```
-
-- **Facts vs judgment**: the model never computes distances, flood fill, collisions or legal moves (plan §4). It only makes contextual judgments over precomputed per-action features. Positions are public physics (schema v2): each snake sees its own head/body plus every other snake's head, direction and length — while intentions stay private.
-- **One call per tick**: all snakes' questions ride in a single `POST /v1/systemone` (plan §5). The decision policy travels once in the shared `team_goal`; per-question instructions stay minimal so tokens don't grow linearly with the agent count.
-- **Resolver (plan §6)**: enumerates all `3^N` joint actions (N ≤ 12) pruning illegal/conflicting ones, maximising `Σ log P`; beam search (width 256) for N > 12. Snakes with no legal action are excluded from the joint (they keep heading and die) instead of disabling resolution for everyone. It enforces hard constraints only — it never hunts food — so it cannot mask Jev's contribution. Every proposed→executed divergence is recorded with an `override_reason`.
-- **Deadline & stale handling (plan §8)**: the tick awaits the model at most `deadlineMs` (default 1500 ms — the measured TypeSafe round trip is ~0.4s p50 / ~1.2s p95 from typical networks; the plan's original 220 ms made every tick fall back). On timeout/error every snake executes the deterministic fallback (prefer STRAIGHT, else max free space). Responses carry a `revision` echoed by the proxy; mismatches are counted as stale and discarded.
-- **Benchmark (plan §7)**: scaling (1/2/5/10/20 agents) and mode comparison (Random / Rule / Jev Raw / Jev Joint) runners with per-tick CSV/JSONL export. The **override rate** is displayed front and center — a high rate means the resolver, not Jev, is playing the game (plan §7.2, Go/No-Go §13).
+- Without a key, Random / Rule modes run fully local and the Jev options stay locked.
+- Or paste the key into the in-app **API 密钥** section — it lives in the local proxy's memory only, never written to disk, never sent back to the browser.
 
 ## Controls
 
 | Control | Effect |
 |---|---|
-| Mode | Random / Rule / **Jev Raw** (top-1, no conflict fixing) / **Jev Joint** (probabilities + resolver) |
-| Agents | 1 / 2 / 5 / 10 / 20 |
-| Safety | Toggles the Joint Resolver on/off (Jev modes only) |
-| Chaos | Relocates all food and drops an obstacle cluster |
-| Seed / Tick ms / Deadline ms | Reproducible runs, tick rate, decision deadline |
-| Benchmark | Scaling or 4-mode comparison runs, CSV/JSONL export |
-| Click a snake | Decision Lens: full probability bars, proposed vs executed, override reason, per-action features |
-| 中 / EN | UI language toggle (Chinese by default, persisted in localStorage) |
-| API Key | Paste your `TYPESAFE_API_KEY` in the UI — stored in the local proxy's process memory only (never persisted, never returned in full); takes effect on the next tick without a server restart. Alternatively keep `.env` |
+| Mode | Random / Rule / Jev Raw / Jev Joint |
+| Agents | 1 / 2 / 5 / 10 / 20 (N > 12 switches the resolver to beam search) |
+| Safety | toggles the Joint Resolver — Jev Raw ↔ Jev Joint |
+| Chaos | relocate all food + drop an obstacle cluster, mid-game |
+| Seed / Tick ms / Deadline ms | reproducible runs, pacing, decision budget |
+| Benchmark | scaling runs (1/2/5/10/20 agents) and 4-mode comparison, CSV/JSONL export |
+| 中 / EN | UI language toggle (Chinese by default) |
 
-## Layout
+## Project layout
 
 ```
-src/game/      deterministic engine: world.ts, collision.ts, features.ts, controllers.ts
-src/jev/       state.ts (shared state schema), questions.ts (Choice template), types.ts
-src/swarm/     resolver.ts (joint optimizer), fallback.ts
-src/sim/       simulation.ts (ArenaSimulation: prepare → decide → applyDecision)
-src/benchmark/ metrics.ts (recorder + summary), runner.ts, export.ts
-src/ui/        Board, ControlPanel, MetricsPanel, DecisionLens, useArena (tick loop)
-server/api.ts  express proxy — hides TYPESAFE_API_KEY, one systemOne call per request
-tests/         collision.test.ts, resolver.test.ts, feature.test.ts
+src/game/       deterministic engine: world, collision, features, controllers
+src/jev/        shared-state builder (v2) + Choice question templates
+src/swarm/      Joint Action Resolver + deterministic fallback
+src/sim/        ArenaSimulation — snapshot → decide → apply, per tick
+src/benchmark/  metrics recorder, scaling runner, CSV/JSONL export
+src/ui/         canvas board, Decision Lens, metrics, controls (zustand + i18n)
+server/api.ts   express proxy — keeps TYPESAFE_API_KEY out of the browser
+tests/          32 unit tests: collision, resolver, features, controllers, state
 ```
 
-The `MultiAgentWorld` contract (`src/game/world.ts`) keeps the resolver and model client world-agnostic — snake is only the first world (plan §3.1, §14).
-
-## Configuration
-
-| Env / field | Default | Meaning |
-|---|---|---|
-| `TYPESAFE_API_KEY` | — | required for Jev modes ([console.typesafe.ai/keys](https://console.typesafe.ai/keys)) |
-| `PORT` | `8799` | proxy port (Vite proxies `/api` to it) |
-| model | `jev-latest` | TypeSafe System-One model |
+`docs/plan.md` is the original development plan (Chinese) this implementation follows — including the Definition of Done and the Go/No-Go gates that decide when *not* to keep building.
